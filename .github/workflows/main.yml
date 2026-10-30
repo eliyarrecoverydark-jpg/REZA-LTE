@@ -1,0 +1,366 @@
+name: Build Native Android APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Create Android Project Structure
+        run: |
+          mkdir -p app/src/main/java/com/rv/changelte
+          mkdir -p app/src/main/assets
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/values
+
+          cp index.html app/src/main/assets/
+          for f in *.jpg *.png *.JPG *.PNG; do
+            [ -e "$f" ] && cp "$f" app/src/main/assets/
+          done
+
+          if [ -f "logo.png" ]; then
+            ffmpeg -y -i logo.png -vf "scale=512:512" app/src/main/res/drawable/ic_launcher.png
+          elif [ -f "logo.jpg" ]; then
+            ffmpeg -y -i logo.jpg -vf "scale=512:512" app/src/main/res/drawable/ic_launcher.png
+          else
+            ffmpeg -y -f lavfi -i color=c=blue:s=512x512 -frames:v 1 app/src/main/res/drawable/ic_launcher.png
+          fi
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "EngineeringRV"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.rv.changelte'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.rv.changelte"
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 3
+                  versionName "3.0"
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.debug
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/res/values/strings.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Engineering R.V</string>
+              <string name="accessibility_desc">سرویس قفل خودکار و مخفی فرکانس روی 4G LTE Only</string>
+          </resources>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/xml/accessibility_service_config.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/accessibility_desc"
+              android:packageNames="com.android.phone,com.android.settings"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:notificationTimeout="40"
+              android:canRetrieveWindowContent="true" />
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <queries>
+                  <package android:name="com.android.phone" />
+                  <package android:name="com.android.settings" />
+              </queries>
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="Engineering R.V"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".LteAutoService"
+                      android:label="Engineering R.V Auto-LTE"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/rv/changelte/LteAutoService.java
+          package com.rv.changelte;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+          import android.widget.Toast;
+          import java.util.List;
+
+          public class LteAutoService extends AccessibilityService {
+              public static volatile boolean autoLockRequested = false;
+              public static volatile boolean spinnerClicked = false;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+
+              @Override
+              public void onAccessibilityEvent(AccessibilityEvent event) {
+                  if (!autoLockRequested) return;
+                  AccessibilityNodeInfo root = getRootInActiveWindow();
+                  if (root == null) return;
+
+                  List<AccessibilityNodeInfo> lteNodes = root.findAccessibilityNodeInfosByText("LTE only");
+                  if (lteNodes != null && !lteNodes.isEmpty()) {
+                      for (AccessibilityNodeInfo node : lteNodes) {
+                          String cls = node.getClassName() != null ? node.getClassName().toString() : "";
+                          if (!cls.contains("Spinner")) {
+                              AccessibilityNodeInfo target = node;
+                              while (target != null && !target.isClickable()) {
+                                  target = target.getParent();
+                              }
+                              if (target != null) {
+                                  target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                              } else {
+                                  node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                              }
+                              autoLockRequested = false;
+                              spinnerClicked = false;
+                              handler.postDelayed(() -> {
+                                  performGlobalAction(GLOBAL_ACTION_BACK);
+                                  Toast.makeText(getApplicationContext(), "✅ شبکه با موفقیت روی 4G LTE Only قفل شد!", Toast.LENGTH_LONG).show();
+                              }, 120);
+                              return;
+                          } else if (spinnerClicked) {
+                              autoLockRequested = false;
+                              spinnerClicked = false;
+                              performGlobalAction(GLOBAL_ACTION_BACK);
+                              Toast.makeText(getApplicationContext(), "✅ شبکه روی 4G LTE Only قرار دارد!", Toast.LENGTH_LONG).show();
+                              return;
+                          }
+                      }
+                  }
+
+                  if (!spinnerClicked) {
+                      AccessibilityNodeInfo spinner = findSpinnerNode(root);
+                      if (spinner != null) {
+                          spinnerClicked = true;
+                          spinner.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                      }
+                  }
+              }
+
+              private AccessibilityNodeInfo findSpinnerNode(AccessibilityNodeInfo node) {
+                  if (node == null) return null;
+                  CharSequence cls = node.getClassName();
+                  if (cls != null && cls.toString().contains("Spinner") && node.isClickable()) {
+                      return node;
+                  }
+                  for (int i = 0; i < node.getChildCount(); i++) {
+                      AccessibilityNodeInfo found = findSpinnerNode(node.getChild(i));
+                      if (found != null) return found;
+                  }
+                  return null;
+              }
+
+              @Override
+              public void onInterrupt() {
+                  autoLockRequested = false;
+                  spinnerClicked = false;
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/rv/changelte/MainActivity.java
+          package com.rv.changelte;
+
+          import android.app.Activity;
+          import android.content.ComponentName;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.Settings;
+          import android.view.Window;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.Toast;
+
+          public class MainActivity extends Activity {
+              private WebView webView;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  requestWindowFeature(Window.FEATURE_NO_TITLE);
+                  getWindow().setStatusBarColor(Color.parseColor("#000614"));
+                  getWindow().setNavigationBarColor(Color.parseColor("#000104"));
+
+                  webView = new WebView(this);
+                  setContentView(webView);
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setAllowFileAccess(true);
+
+                  webView.addJavascriptInterface(new AndroidBridge(), "AndroidBridge");
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.loadUrl("file:///android_asset/index.html");
+              }
+
+              public class AndroidBridge {
+                  @JavascriptInterface
+                  public boolean isAutoServiceEnabled() {
+                      String pref = Settings.Secure.getString(getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+                      return pref != null && pref.contains(getPackageName() + "/" + LteAutoService.class.getName());
+                  }
+
+                  @JavascriptInterface
+                  public void openAccessibilitySettings() {
+                      runOnUiThread(() -> {
+                          try {
+                              Intent intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
+                              startActivity(intent);
+                              Toast.makeText(MainActivity.this, "گزینه Engineering R.V Auto-LTE را فعال کنید", Toast.LENGTH_LONG).show();
+                          } catch (Exception e) {
+                              Toast.makeText(MainActivity.this, "خطا در باز کردن تنظیمات", Toast.LENGTH_SHORT).show();
+                          }
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void openMenu(String method) {
+                      runOnUiThread(() -> {
+                          LteAutoService.autoLockRequested = true;
+                          LteAutoService.spinnerClicked = false;
+
+                          handler.postDelayed(() -> {
+                              LteAutoService.autoLockRequested = false;
+                              LteAutoService.spinnerClicked = false;
+                          }, 3500);
+
+                          String[][] targets;
+                          if ("android11_plus".equals(method)) {
+                              targets = new String[][] {
+                                  {"com.android.phone", "com.android.phone.settings.RadioInfo"},
+                                  {"com.android.phone", "com.android.phone.RadioInfo"},
+                                  {"com.android.settings", "com.android.settings.RadioInfo"}
+                              };
+                          } else {
+                              targets = new String[][] {
+                                  {"com.android.settings", "com.android.settings.RadioInfo"},
+                                  {"com.android.phone", "com.android.phone.settings.RadioInfo"},
+                                  {"com.android.phone", "com.android.phone.RadioInfo"}
+                              };
+                          }
+
+                          boolean opened = false;
+                          for (String[] target : targets) {
+                              try {
+                                  Intent intent = new Intent(Intent.ACTION_MAIN);
+                                  intent.setComponent(new ComponentName(target[0], target[1]));
+                                  intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+                                  startActivity(intent);
+                                  opened = true;
+                                  break;
+                              } catch (Exception ignored) {
+                              }
+                          }
+
+                          if (!opened) {
+                              LteAutoService.autoLockRequested = false;
+                              Toast.makeText(MainActivity.this, "منوی مخفی شبکه در دسترس نیست", Toast.LENGTH_LONG).show();
+                          }
+                      });
+                  }
+              }
+          }
+          EOF
+
+      - name: Build Release APK
+        run: gradle assembleRelease
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Engineering-RV-LTE-APK
+          path: app/build/outputs/apk/release/app-release.apk
